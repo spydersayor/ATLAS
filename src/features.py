@@ -128,7 +128,7 @@ def _levenshtein_similarity(a: str, b: str) -> float:
     1.0 = identical
     0.0 = maximally different
 
-    This uses RapidFuzz's normalized edit-distance similarity.
+    Preserves the existing ATLAS implementation semantics.
     """
     a = _safe_text(a)
     b = _safe_text(b)
@@ -159,6 +159,160 @@ def _length_difference(a: str, b: str) -> int:
     Absolute character-length difference.
     """
     return abs(len(_safe_text(a)) - len(_safe_text(b)))
+
+
+# ============================================================
+# FAST INTERNAL HELPERS
+# ============================================================
+
+def _prepare_text(value) -> str:
+    """
+    Fast text preparation for the hot path.
+
+    This intentionally preserves _safe_text semantics.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if pd.isna(value):
+        return ""
+
+    return str(value).strip()
+
+
+def _build_source_lookup(source_df: pd.DataFrame) -> dict:
+    """
+    Build a lightweight Python dictionary for O(1)-style
+    entity lookup without creating pandas Series objects.
+
+    Values are compact tuples:
+        (business_name, business_address, country)
+    """
+    lookup = {}
+
+    entity_ids = source_df["entity_id"].to_numpy(copy=False)
+    names = source_df["business_name"].to_numpy(copy=False)
+    addresses = source_df["business_address"].to_numpy(copy=False)
+    countries = source_df["country"].to_numpy(copy=False)
+
+    for entity_id, name, address, country in zip(
+        entity_ids,
+        names,
+        addresses,
+        countries,
+    ):
+        lookup[entity_id] = (
+            name,
+            address,
+            country,
+        )
+
+    return lookup
+
+
+def _compute_text_pair_features(
+    text_1: str,
+    text_2: str,
+) -> tuple[float, float, float, float, int]:
+    """
+    Compute the shared fuzzy/text features for one field.
+
+    Returns:
+        ratio,
+        levenshtein,
+        jaccard,
+        token_similarity,
+        length_difference
+
+    Important:
+        name_ratio and name_levenshtein currently have identical
+        semantics in the existing ATLAS implementation, so the
+        RapidFuzz ratio is computed once and reused.
+    """
+    if not text_1 or not text_2:
+        return 0.0, 0.0, 0.0, 0.0, abs(len(text_1) - len(text_2))
+
+    ratio = fuzz.ratio(text_1, text_2) / 100.0
+
+    tokens_1 = set(text_1.split())
+    tokens_2 = set(text_2.split())
+
+    if tokens_1 and tokens_2:
+        union = tokens_1 | tokens_2
+        jaccard = len(tokens_1 & tokens_2) / len(union)
+    else:
+        jaccard = 0.0
+
+    token_similarity = fuzz.token_set_ratio(
+        text_1,
+        text_2,
+    ) / 100.0
+
+    return (
+        ratio,
+        ratio,
+        jaccard,
+        token_similarity,
+        abs(len(text_1) - len(text_2)),
+    )
+
+
+def _compute_blocking_features_fast(
+    blocker_sources,
+    num_blockers,
+) -> dict:
+    """
+    Fast blocker provenance feature computation.
+
+    Preserves the existing accepted blocker representations:
+        - None / NaN
+        - comma-separated string
+        - iterable
+    """
+    if blocker_sources is None:
+        blockers = []
+    elif isinstance(blocker_sources, float) and pd.isna(blocker_sources):
+        blockers = []
+    elif isinstance(blocker_sources, str):
+        blockers = [
+            x.strip()
+            for x in blocker_sources.split(",")
+            if x.strip()
+        ]
+    elif isinstance(blocker_sources, Iterable):
+        blockers = list(blocker_sources)
+    else:
+        blockers = []
+
+    normalized = {
+        str(blocker).strip().lower()
+        for blocker in blockers
+    }
+
+    return {
+        "was_name_block": float(
+            any("name" in blocker for blocker in normalized)
+        ),
+        "was_address_block": float(
+            any("address" in blocker for blocker in normalized)
+        ),
+        "was_country_block": float(
+            any("country" in blocker for blocker in normalized)
+        ),
+        "has_exact_name_block": float(
+            "name_exact" in normalized
+        ),
+        "has_exact_address_block": float(
+            "address_exact" in normalized
+        ),
+        "multiple_independent_blockers": float(
+            len(normalized) >= 2
+        ),
+        "num_blockers": float(num_blockers),
+    }
 
 
 # ============================================================
@@ -235,27 +389,24 @@ class FeatureEngineer:
         name_1 = _safe_text(name_1)
         name_2 = _safe_text(name_2)
 
+        ratio, levenshtein, jaccard, token_similarity, length_difference = (
+            _compute_text_pair_features(
+                name_1,
+                name_2,
+            )
+        )
+
         return {
             "name_exact": float(
-                bool(name_1) and bool(name_2) and name_1 == name_2
+                bool(name_1)
+                and bool(name_2)
+                and name_1 == name_2
             ),
-            "name_ratio": _ratio(name_1, name_2),
-            "name_levenshtein": _levenshtein_similarity(
-                name_1,
-                name_2,
-            ),
-            "name_jaccard": _jaccard_similarity(
-                name_1,
-                name_2,
-            ),
-            "name_token_similarity": _token_similarity(
-                name_1,
-                name_2,
-            ),
-            "name_length_difference": _length_difference(
-                name_1,
-                name_2,
-            ),
+            "name_ratio": ratio,
+            "name_levenshtein": levenshtein,
+            "name_jaccard": jaccard,
+            "name_token_similarity": token_similarity,
+            "name_length_difference": length_difference,
         }
 
     def _compute_address_features(
@@ -268,6 +419,7 @@ class FeatureEngineer:
         Generate address-related features.
 
         Missing addresses are explicitly represented.
+
         Missing address does not automatically become a negative
         matching signal.
         """
@@ -277,28 +429,27 @@ class FeatureEngineer:
         address_1_available = bool(address_1)
         address_2_available = bool(address_2)
 
+        (
+            ratio,
+            _levenshtein,
+            jaccard,
+            token_similarity,
+            length_difference,
+        ) = _compute_text_pair_features(
+            address_1,
+            address_2,
+        )
+
         return {
             "address_exact": float(
                 address_1_available
                 and address_2_available
                 and address_1 == address_2
             ),
-            "address_ratio": _ratio(
-                address_1,
-                address_2,
-            ),
-            "address_jaccard": _jaccard_similarity(
-                address_1,
-                address_2,
-            ),
-            "address_token_similarity": _token_similarity(
-                address_1,
-                address_2,
-            ),
-            "address_length_difference": _length_difference(
-                address_1,
-                address_2,
-            ),
+            "address_ratio": ratio,
+            "address_jaccard": jaccard,
+            "address_token_similarity": token_similarity,
+            "address_length_difference": length_difference,
             "address_available_both": float(
                 address_1_available and address_2_available
             ),
@@ -378,53 +529,14 @@ class FeatureEngineer:
     ) -> dict:
         """
         Convert blocker provenance into numeric model features.
+
+        Kept for compatibility with callers/tests that may directly
+        invoke this helper.
         """
-        blocker_sources = candidate_row["blocker_sources"]
-
-        if blocker_sources is None or (
-            isinstance(blocker_sources, float)
-            and pd.isna(blocker_sources)
-        ):
-            blockers = []
-        elif isinstance(blocker_sources, str):
-            blockers = [
-                x.strip()
-                for x in blocker_sources.split(",")
-                if x.strip()
-            ]
-        elif isinstance(blocker_sources, Iterable):
-            blockers = list(blocker_sources)
-        else:
-            blockers = []
-
-        normalized = {
-            str(blocker).strip().lower()
-            for blocker in blockers
-        }
-
-        return {
-            "was_name_block": float(
-                any("name" in blocker for blocker in normalized)
-            ),
-            "was_address_block": float(
-                any("address" in blocker for blocker in normalized)
-            ),
-            "was_country_block": float(
-                any("country" in blocker for blocker in normalized)
-            ),
-            "has_exact_name_block": float(
-                "name_exact" in normalized
-            ),
-            "has_exact_address_block": float(
-                "address_exact" in normalized
-            ),
-            "multiple_independent_blockers": float(
-                len(normalized) >= 2
-            ),
-            "num_blockers": float(
-                candidate_row["num_blockers"]
-            ),
-        }
+        return _compute_blocking_features_fast(
+            candidate_row["blocker_sources"],
+            candidate_row["num_blockers"],
+        )
 
     # --------------------------------------------------------
     # Public API
@@ -466,33 +578,88 @@ class FeatureEngineer:
         self.validate_candidate_contract(candidate_pairs)
 
         # ----------------------------------------------------
-        # Index source tables for O(1)-style lookup.
+        # FAST SOURCE LOOKUPS
+        #
+        # Convert source tables into compact Python dictionaries.
+        # This avoids pandas .loc / Series creation inside the
+        # candidate loop.
         # ----------------------------------------------------
 
-        s1_lookup = source1.set_index("entity_id", drop=False)
-        s2_lookup = source2.set_index("entity_id", drop=False)
-        s3_lookup = source3.set_index("entity_id", drop=False)
+        s1_lookup = _build_source_lookup(source1)
+        s2_lookup = _build_source_lookup(source2)
+        s3_lookup = _build_source_lookup(source3)
+
+        # ----------------------------------------------------
+        # PRE-EXTRACT CANDIDATE COLUMNS
+        #
+        # Avoid iterrows(), which creates one pandas Series per
+        # candidate row.
+        # ----------------------------------------------------
+
+        s1_ids = candidate_pairs["source1_entity_id"].to_numpy(
+            copy=False
+        )
+
+        candidate_ids = candidate_pairs[
+            "candidate_entity_id"
+        ].to_numpy(
+            copy=False
+        )
+
+        candidate_sources = candidate_pairs[
+            "candidate_source"
+        ].to_numpy(
+            copy=False
+        )
+
+        blocker_sources = candidate_pairs[
+            "blocker_sources"
+        ].to_numpy(
+            copy=False
+        )
+
+        num_blockers = candidate_pairs[
+            "num_blockers"
+        ].to_numpy(
+            copy=False
+        )
 
         feature_rows = []
 
-        for _, candidate in candidate_pairs.iterrows():
+        # ----------------------------------------------------
+        # HOT LOOP
+        # ----------------------------------------------------
 
-            s1_id = candidate["source1_entity_id"]
-            candidate_id = candidate["candidate_entity_id"]
-            candidate_source = str(
-                candidate["candidate_source"]
-            )
+        for (
+            s1_id,
+            candidate_id,
+            candidate_source_raw,
+            blockers,
+            blocker_count,
+        ) in zip(
+            s1_ids,
+            candidate_ids,
+            candidate_sources,
+            blocker_sources,
+            num_blockers,
+        ):
+
+            candidate_source = str(candidate_source_raw)
 
             # ----------------------------------------------
             # Retrieve S1
             # ----------------------------------------------
 
-            if s1_id not in s1_lookup.index:
+            try:
+                (
+                    s1_name_raw,
+                    s1_address_raw,
+                    s1_country_raw,
+                ) = s1_lookup[s1_id]
+            except KeyError:
                 raise KeyError(
                     f"Source1 entity_id not found: {s1_id}"
-                )
-
-            s1 = s1_lookup.loc[s1_id]
+                ) from None
 
             # ----------------------------------------------
             # Retrieve candidate from S2/S3
@@ -508,75 +675,174 @@ class FeatureEngineer:
                     f"{candidate_source}"
                 )
 
-            if candidate_id not in lookup.index:
+            try:
+                (
+                    candidate_name_raw,
+                    candidate_address_raw,
+                    candidate_country_raw,
+                ) = lookup[candidate_id]
+            except KeyError:
                 raise KeyError(
                     f"{candidate_source} entity_id not found: "
                     f"{candidate_id}"
-                )
-
-            candidate_entity = lookup.loc[candidate_id]
+                ) from None
 
             # ----------------------------------------------
-            # Name
+            # Prepare text once
             # ----------------------------------------------
 
-            name_features = self._compute_name_features(
-                s1["business_name"],
-                candidate_entity["business_name"],
+            s1_name = _prepare_text(s1_name_raw)
+            candidate_name = _prepare_text(candidate_name_raw)
+
+            s1_address = _prepare_text(s1_address_raw)
+            candidate_address = _prepare_text(candidate_address_raw)
+
+            s1_country = _prepare_text(s1_country_raw)
+            candidate_country = _prepare_text(candidate_country_raw)
+
+            # ----------------------------------------------
+            # NAME FEATURES
+            # ----------------------------------------------
+
+            (
+                name_ratio,
+                name_levenshtein,
+                name_jaccard,
+                name_token_similarity,
+                name_length_difference,
+            ) = _compute_text_pair_features(
+                s1_name,
+                candidate_name,
             )
 
-            # ----------------------------------------------
-            # Address
-            # ----------------------------------------------
-
-            address_features = self._compute_address_features(
-                s1["business_address"],
-                candidate_entity["business_address"],
-                candidate_source,
-            )
-
-            # ----------------------------------------------
-            # Country
-            # ----------------------------------------------
-
-            country_features = self._compute_country_features(
-                s1["country"],
-                candidate_entity["country"],
-            )
-
-            # ----------------------------------------------
-            # Cross-field evidence
-            # ----------------------------------------------
-
-            cross_features = self._compute_cross_field_features(
-                name_features,
-                address_features,
-            )
-
-            # ----------------------------------------------
-            # Blocking provenance
-            # ----------------------------------------------
-
-            blocking_features = self._compute_blocking_features(
-                candidate
-            )
-
-            # ----------------------------------------------
-            # Assemble feature row
-            # ----------------------------------------------
-
-            row = {
-                "source1_entity_id": s1_id,
-                "candidate_entity_id": candidate_id,
-                "candidate_source": candidate_source,
-                **name_features,
-                **address_features,
-                **country_features,
-                **cross_features,
-                **blocking_features,
+            name_features = {
+                "name_exact": float(
+                    bool(s1_name)
+                    and bool(candidate_name)
+                    and s1_name == candidate_name
+                ),
+                "name_ratio": name_ratio,
+                "name_levenshtein": name_levenshtein,
+                "name_jaccard": name_jaccard,
+                "name_token_similarity": name_token_similarity,
+                "name_length_difference": name_length_difference,
             }
 
-            feature_rows.append(row)
+            # ----------------------------------------------
+            # ADDRESS FEATURES
+            # ----------------------------------------------
+
+            address_1_available = bool(s1_address)
+            address_2_available = bool(candidate_address)
+
+            (
+                address_ratio,
+                _address_levenshtein,
+                address_jaccard,
+                address_token_similarity,
+                address_length_difference,
+            ) = _compute_text_pair_features(
+                s1_address,
+                candidate_address,
+            )
+
+            address_features = {
+                "address_exact": float(
+                    address_1_available
+                    and address_2_available
+                    and s1_address == candidate_address
+                ),
+                "address_ratio": address_ratio,
+                "address_jaccard": address_jaccard,
+                "address_token_similarity": address_token_similarity,
+                "address_length_difference": address_length_difference,
+                "address_available_both": float(
+                    address_1_available
+                    and address_2_available
+                ),
+                "address_missing_source2": float(
+                    candidate_source == "S2"
+                    and not address_2_available
+                ),
+                "address_missing_source3": float(
+                    candidate_source == "S3"
+                    and not address_2_available
+                ),
+            }
+
+            # ----------------------------------------------
+            # COUNTRY
+            # ----------------------------------------------
+
+            country_features = {
+                "country_exact": float(
+                    bool(s1_country)
+                    and bool(candidate_country)
+                    and s1_country == candidate_country
+                )
+            }
+
+            # ----------------------------------------------
+            # CROSS-FIELD EVIDENCE
+            # ----------------------------------------------
+
+            name_score = name_token_similarity
+            address_score = address_token_similarity
+
+            both_available = (
+                address_1_available
+                and address_2_available
+            )
+
+            if both_available:
+                agreement = min(
+                    name_score,
+                    address_score,
+                )
+
+                gap = abs(
+                    name_score - address_score
+                )
+
+                combined = (
+                    name_score + address_score
+                ) / 2.0
+            else:
+                agreement = 0.0
+                gap = 0.0
+                combined = name_score
+
+            cross_features = {
+                "name_address_agreement": agreement,
+                "name_address_gap": gap,
+                "combined_name_address_score": combined,
+            }
+
+            # ----------------------------------------------
+            # BLOCKING PROVENANCE
+            # ----------------------------------------------
+
+            blocking_features = _compute_blocking_features_fast(
+                blockers,
+                blocker_count,
+            )
+
+            # ----------------------------------------------
+            # ASSEMBLE
+            # ----------------------------------------------
+
+            feature_rows.append(
+                {
+                    "source1_entity_id": s1_id,
+                    "candidate_entity_id": candidate_id,
+                    "candidate_source": candidate_source,
+                    **name_features,
+                    **address_features,
+                    **country_features,
+                    **cross_features,
+                    **blocking_features,
+                }
+            )
 
         result = pd.DataFrame(feature_rows)
 

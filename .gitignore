@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+dataset/
+output/
+
+*.pkl
+*.joblib
+*.model
+
+.env
+
+.DS_Store
+Thumbs.db

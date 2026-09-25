@@ -216,12 +216,6 @@ def calculate_candidate_recall(
     """
     Calculate candidate recall.
 
-    Candidate recall is:
-
-        retrieved true matches
-        -----------------------
-          total true matches
-
     A true match that never appears in the candidate set is a
     retrieval/blocking failure, not an ML false negative.
 
@@ -261,16 +255,6 @@ def calculate_candidate_distribution(
 ) -> dict[str, float]:
     """
     Calculate candidate-set size statistics per Source-1 entity.
-
-    Returns:
-        total_candidate_pairs
-        num_s1_entities
-        avg_candidates_per_s1
-        median_candidates_per_s1
-        p90_candidates_per_s1
-        p95_candidates_per_s1
-        p99_candidates_per_s1
-        max_candidates_per_s1
     """
     candidate_counts = [
         len(candidate_set)
@@ -310,23 +294,9 @@ def label_candidate_pairs(
     """
     Label retrieved candidate pairs using ground truth.
 
-    Each input tuple is:
-
-        (source1_entity_id, candidate_entity_id)
-
-    Returns dictionaries containing:
-        source1_entity_id
-        candidate_entity_id
-        label
-
-    label:
-        1 = true match
-        0 = candidate is not a true match
-
-    IMPORTANT:
     Only candidates that actually exist in candidate_pairs are
-    labeled. True matches that are absent from candidate_pairs
-    are NOT converted into negative examples.
+    labeled. True matches absent from candidate_pairs are NOT
+    converted into negative examples.
     """
     labeled_pairs = []
 
@@ -357,21 +327,16 @@ def calculate_retrieval_report(
     """
     Calculate a complete candidate-retrieval report.
 
-    The report includes:
-
-    - total true matches
-    - retrieved true matches
-    - missed true matches
-    - candidate recall
-    - Source-1 entities with completely missed true matches
-    - candidate-count distribution
-    - S2 vs S3 retrieval statistics
-    - no-match entity statistics
-    - multi-match entity statistics
-
-    Candidate pairs are expected to be unique tuples of:
-
-        (source1_entity_id, candidate_entity_id)
+    Includes:
+        - total true matches
+        - retrieved true matches
+        - missed true matches
+        - candidate recall
+        - completely missed Source-1 entities
+        - candidate count distribution
+        - S2 vs S3 retrieval statistics
+        - no-match statistics
+        - multi-match statistics
     """
     candidate_counts = {
         source1_entity_id: 0
@@ -472,7 +437,7 @@ def calculate_retrieval_report(
     s2_retrieved = set()
     s3_retrieved = set()
 
-    for source1_entity_id, matches in retrieved_matches.items():
+    for matches in retrieved_matches.values():
         for entity_id in matches:
             if entity_id.startswith("S2-"):
                 s2_retrieved.add(entity_id)
@@ -580,34 +545,7 @@ def calculate_binary_metrics(
     """
     Calculate candidate-level binary classification metrics.
 
-    Parameters
-    ----------
-    y_true:
-        Iterable containing ground-truth binary labels.
-        1 = true match
-        0 = non-match
-
-    y_scores:
-        Iterable containing model scores for the same candidates.
-
-    threshold:
-        Score threshold used to convert model scores into
-        binary predictions.
-
-        Scores >= threshold are predicted as positive.
-
-    Returns
-    -------
-    dict
-        Contains:
-
-        - precision
-        - recall
-        - f0.5
-        - tp
-        - fp
-        - fn
-        - tn
+    Scores >= threshold are predicted as positive.
     """
     y_true_array = np.asarray(
         list(y_true),
@@ -714,4 +652,100 @@ def calculate_binary_metrics(
         "fp": fp,
         "fn": fn,
         "tn": tn,
+    }
+
+
+def classify_candidate_errors(
+    candidate_pairs: Iterable[tuple[str, str]],
+    ground_truth: GroundTruth,
+    predictions: Dict[tuple[str, str], int],
+) -> dict:
+    """
+    Classify candidate-level and retrieval-level errors.
+
+    Categories:
+
+        TP
+        FP
+        FN_WITH_CANDIDATE
+        BLOCKING_FAILURE
+
+    A true match that was never retrieved is a blocking failure,
+    not a classification false negative.
+
+    Parameters
+    ----------
+    candidate_pairs:
+        Retrieved candidate pairs represented as:
+            (source1_entity_id, candidate_entity_id)
+
+    ground_truth:
+        Mapping from Source-1 entity IDs to true matched IDs.
+
+    predictions:
+        Mapping from candidate pair to binary model prediction:
+            1 = predicted match
+            0 = predicted non-match
+    """
+    candidate_set = set(candidate_pairs)
+
+    true_positives = []
+    false_positives = []
+    false_negatives_with_candidate = []
+    blocking_failures = []
+
+    for pair in candidate_set:
+        source1_entity_id, candidate_entity_id = pair
+
+        is_true = is_true_match(
+            ground_truth,
+            source1_entity_id,
+            candidate_entity_id,
+        )
+
+        if pair not in predictions:
+            raise ValueError(
+                "Missing prediction for candidate pair: "
+                f"{pair}"
+            )
+
+        prediction = predictions[pair]
+
+        if prediction not in (0, 1):
+            raise ValueError(
+                "Predictions must contain only 0 and 1."
+            )
+
+        if is_true and prediction == 1:
+            true_positives.append(pair)
+
+        elif not is_true and prediction == 1:
+            false_positives.append(pair)
+
+        elif is_true and prediction == 0:
+            false_negatives_with_candidate.append(pair)
+
+    for source1_entity_id, true_matches in ground_truth.items():
+        for candidate_entity_id in true_matches:
+            pair = (
+                source1_entity_id,
+                candidate_entity_id,
+            )
+
+            if pair not in candidate_set:
+                blocking_failures.append(pair)
+
+    return {
+        "true_positives": true_positives,
+        "false_positives": false_positives,
+        "false_negatives_with_candidate":
+            false_negatives_with_candidate,
+        "blocking_failures": blocking_failures,
+        "counts": {
+            "true_positives": len(true_positives),
+            "false_positives": len(false_positives),
+            "false_negatives_with_candidate":
+                len(false_negatives_with_candidate),
+            "blocking_failures": len(blocking_failures),
+        },
     }

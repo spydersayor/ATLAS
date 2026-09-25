@@ -19,8 +19,7 @@ def parse_ground_truth(file_path: str | Path) -> GroundTruth:
             "S1-125": set(),
         }
 
-    The parser is streaming/memory-conscious and does not load the
-    entire TSV into a pandas DataFrame.
+    Supports zero, one, and multiple true matches.
     """
 
     ground_truth: GroundTruth = {}
@@ -81,11 +80,7 @@ def get_true_matches(
     ground_truth: GroundTruth,
     source1_entity_id: str,
 ) -> Set[str]:
-    """
-    Return the set of true matches for a Source-1 entity.
-
-    Unknown Source-1 entities are treated as having no matches.
-    """
+    """Return true matches for a Source-1 entity."""
 
     return ground_truth.get(source1_entity_id, set())
 
@@ -95,10 +90,7 @@ def is_true_match(
     source1_entity_id: str,
     candidate_entity_id: str,
 ) -> bool:
-    """
-    Check whether a candidate entity is a true match
-    for a Source-1 entity.
-    """
+    """Check whether a candidate is a ground-truth match."""
 
     return candidate_entity_id in ground_truth.get(source1_entity_id, set())
 
@@ -107,9 +99,7 @@ def calculate_entity_metrics(
     true_matches: set[str],
     predicted_matches: set[str],
 ) -> dict[str, float]:
-    """
-    Calculate precision, recall, and F0.5 for one Source-1 entity.
-    """
+    """Calculate precision, recall, and F0.5 for one Source-1 entity."""
 
     true_matches = set(true_matches)
     predicted_matches = set(predicted_matches)
@@ -164,10 +154,7 @@ def calculate_macro_metrics(
     ground_truth: dict[str, set[str]],
     predictions: dict[str, set[str]],
 ) -> dict[str, float]:
-    """
-    Calculate macro-averaged precision, recall, and F0.5
-    across Source-1 entities.
-    """
+    """Calculate macro precision, recall, and F0.5."""
 
     entity_ids = set(ground_truth) | set(predictions)
 
@@ -205,10 +192,7 @@ def calculate_candidate_recall(
     ground_truth: dict[str, set[str]],
     candidates: dict[str, set[str]],
 ) -> dict[str, float]:
-    """
-    Measure how many ground-truth true matches were retrieved
-    by candidate generation.
-    """
+    """Measure true-match retrieval recall."""
 
     total_true_matches = 0
     retrieved_true_matches = 0
@@ -218,7 +202,6 @@ def calculate_candidate_recall(
         candidate_matches = candidates.get(source1_id, set())
 
         total_true_matches += len(true_matches)
-
         retrieved_true_matches += len(
             true_matches & candidate_matches
         )
@@ -240,9 +223,7 @@ def calculate_candidate_recall(
 def calculate_candidate_distribution(
     candidates: dict[str, set[str]],
 ) -> dict[str, float]:
-    """
-    Calculate the distribution of candidate counts per Source-1 entity.
-    """
+    """Calculate candidate-count distribution per Source-1 entity."""
 
     candidate_counts = np.array(
         [
@@ -293,24 +274,13 @@ def label_candidate_pairs(
     ground_truth: GroundTruth,
 ) -> list[dict[str, str | int]]:
     """
-    Label generated candidate pairs using ground truth.
+    Label generated candidate pairs.
 
-    Each candidate pair is:
+    A candidate matching ground truth receives label=1.
+    A candidate not in ground truth receives label=0.
 
-        (source1_entity_id, candidate_entity_id)
-
-    Returns one dictionary per candidate:
-
-        {
-            "source1_entity_id": "S1-123",
-            "candidate_entity_id": "S2-456",
-            "label": 1,
-        }
-
-    Important:
-    A ground-truth match that is absent from candidate_pairs is NOT
-    returned as label=0. That case is a blocking/retrieval failure
-    and must be measured separately.
+    A ground-truth match that was never generated is NOT converted
+    into an ML negative. It is a retrieval/blocking failure.
     """
 
     labeled_pairs: list[dict[str, str | int]] = []
@@ -329,3 +299,229 @@ def label_candidate_pairs(
         )
 
     return labeled_pairs
+
+
+def calculate_retrieval_report(
+    ground_truth: GroundTruth,
+    candidate_pairs: Iterable[tuple[str, str]],
+) -> dict:
+    """
+    Produce a complete candidate-generation/retrieval report.
+
+    Candidate pairs use the neutral representation:
+
+        (source1_entity_id, candidate_entity_id)
+
+    The function does not assume a one-to-one relationship.
+
+    It distinguishes:
+    - retrieved true matches
+    - missed true matches
+    - no-match Source-1 entities
+    - multi-match Source-1 entities
+    - S2 vs S3 retrieval
+    - candidate-count distribution
+
+    Candidate pairs are expected to be unique.
+    """
+
+    # Candidate count for every S1 in ground truth.
+    # This means an S1 with zero candidates contributes a zero.
+    candidate_counts: dict[str, int] = {
+        source1_id: 0
+        for source1_id in ground_truth
+    }
+
+    # Retrieved true matches for each S1.
+    retrieved_matches: dict[str, set[str]] = {
+        source1_id: set()
+        for source1_id in ground_truth
+    }
+
+    total_candidate_pairs = 0
+
+    # Process candidate pairs without requiring a giant list copy.
+    for source1_id, candidate_id in candidate_pairs:
+        total_candidate_pairs += 1
+
+        if source1_id not in candidate_counts:
+            candidate_counts[source1_id] = 0
+            retrieved_matches[source1_id] = set()
+
+        candidate_counts[source1_id] += 1
+
+        true_matches = ground_truth.get(source1_id, set())
+
+        if candidate_id in true_matches:
+            retrieved_matches[source1_id].add(candidate_id)
+
+    # Overall retrieval statistics.
+    total_true_matches = 0
+    true_matches_retrieved = 0
+
+    completely_missed_s1: list[str] = []
+
+    for source1_id, true_matches in ground_truth.items():
+        true_matches = set(true_matches)
+
+        total_true_matches += len(true_matches)
+
+        retrieved = retrieved_matches.get(
+            source1_id,
+            set(),
+        )
+
+        true_matches_retrieved += len(
+            true_matches & retrieved
+        )
+
+        if true_matches and not (true_matches & retrieved):
+            completely_missed_s1.append(source1_id)
+
+    true_matches_missed = (
+        total_true_matches - true_matches_retrieved
+    )
+
+    if total_true_matches == 0:
+        candidate_recall = 1.0
+    else:
+        candidate_recall = (
+            true_matches_retrieved / total_true_matches
+        )
+
+    # Candidate-count distribution across all ground-truth S1 entities.
+    counts = np.array(
+        list(candidate_counts.values()),
+        dtype=np.int64,
+    )
+
+    if len(counts) == 0:
+        candidate_count_mean = 0.0
+        candidate_count_median = 0.0
+        candidate_count_p90 = 0.0
+        candidate_count_p95 = 0.0
+        candidate_count_p99 = 0.0
+        candidate_count_max = 0
+    else:
+        candidate_count_mean = float(np.mean(counts))
+        candidate_count_median = float(np.percentile(counts, 50))
+        candidate_count_p90 = float(np.percentile(counts, 90))
+        candidate_count_p95 = float(np.percentile(counts, 95))
+        candidate_count_p99 = float(np.percentile(counts, 99))
+        candidate_count_max = int(np.max(counts))
+
+    # S2 / S3 retrieval statistics.
+    s2_true = 0
+    s2_retrieved = 0
+    s3_true = 0
+    s3_retrieved = 0
+
+    for source1_id, true_matches in ground_truth.items():
+        retrieved = retrieved_matches.get(
+            source1_id,
+            set(),
+        )
+
+        for entity_id in true_matches:
+            if entity_id.startswith("S2-"):
+                s2_true += 1
+                if entity_id in retrieved:
+                    s2_retrieved += 1
+
+            elif entity_id.startswith("S3-"):
+                s3_true += 1
+                if entity_id in retrieved:
+                    s3_retrieved += 1
+
+    s2_recall = (
+        s2_retrieved / s2_true
+        if s2_true
+        else 1.0
+    )
+
+    s3_recall = (
+        s3_retrieved / s3_true
+        if s3_true
+        else 1.0
+    )
+
+    # No-match statistics.
+    no_match_s1 = [
+        source1_id
+        for source1_id, true_matches in ground_truth.items()
+        if not true_matches
+    ]
+
+    no_match_with_candidates = sum(
+        1
+        for source1_id in no_match_s1
+        if candidate_counts.get(source1_id, 0) > 0
+    )
+
+    # Multi-match statistics.
+    multi_match_s1 = [
+        source1_id
+        for source1_id, true_matches in ground_truth.items()
+        if len(true_matches) > 1
+    ]
+
+    multi_match_true_matches = sum(
+        len(ground_truth[source1_id])
+        for source1_id in multi_match_s1
+    )
+
+    multi_match_fully_retrieved = sum(
+        1
+        for source1_id in multi_match_s1
+        if ground_truth[source1_id].issubset(
+            retrieved_matches.get(source1_id, set())
+        )
+    )
+
+    return {
+        "total_true_matches": total_true_matches,
+        "true_matches_retrieved": true_matches_retrieved,
+        "true_matches_missed": true_matches_missed,
+        "candidate_recall": candidate_recall,
+
+        "s1_entities_with_completely_missed_true_matches": (
+            completely_missed_s1
+        ),
+
+        "candidate_count_mean": candidate_count_mean,
+        "candidate_count_median": candidate_count_median,
+        "candidate_count_p90": candidate_count_p90,
+        "candidate_count_p95": candidate_count_p95,
+        "candidate_count_p99": candidate_count_p99,
+        "candidate_count_max": candidate_count_max,
+        "total_candidate_pairs": total_candidate_pairs,
+
+        "s2": {
+            "true_matches": s2_true,
+            "retrieved": s2_retrieved,
+            "missed": s2_true - s2_retrieved,
+            "recall": s2_recall,
+        },
+
+        "s3": {
+            "true_matches": s3_true,
+            "retrieved": s3_retrieved,
+            "missed": s3_true - s3_retrieved,
+            "recall": s3_recall,
+        },
+
+        "no_match": {
+            "s1_entities": len(no_match_s1),
+            "s1_entities_with_candidates": (
+                no_match_with_candidates
+            ),
+        },
+
+        "multi_match": {
+            "s1_entities": len(multi_match_s1),
+            "true_matches": multi_match_true_matches,
+            "fully_retrieved_entities": (
+                multi_match_fully_retrieved
+            ),
+        },
+    }

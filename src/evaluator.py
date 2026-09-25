@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Set, Iterable
 
 import numpy as np
 
@@ -109,11 +109,6 @@ def calculate_entity_metrics(
 ) -> dict[str, float]:
     """
     Calculate precision, recall, and F0.5 for one Source-1 entity.
-
-    Special cases:
-    - true={} and predicted={} -> all metrics are 1.0
-    - true={} and predicted!= {} -> all metrics are 0.0
-    - true!={} and predicted={} -> all metrics are 0.0
     """
 
     true_matches = set(true_matches)
@@ -146,7 +141,6 @@ def calculate_entity_metrics(
     recall = true_positive / len(true_matches)
 
     beta = 0.5
-
     denominator = (beta ** 2 * precision) + recall
 
     if denominator == 0:
@@ -173,9 +167,6 @@ def calculate_macro_metrics(
     """
     Calculate macro-averaged precision, recall, and F0.5
     across Source-1 entities.
-
-    Every Source-1 entity appearing in either ground truth
-    or predictions is evaluated.
     """
 
     entity_ids = set(ground_truth) | set(predictions)
@@ -216,13 +207,7 @@ def calculate_candidate_recall(
 ) -> dict[str, float]:
     """
     Measure how many ground-truth true matches were retrieved
-    by the candidate-generation stage.
-
-    Candidate recall:
-
-        retrieved true matches
-        -----------------------
-        total true matches
+    by candidate generation.
     """
 
     total_true_matches = 0
@@ -257,16 +242,6 @@ def calculate_candidate_distribution(
 ) -> dict[str, float]:
     """
     Calculate the distribution of candidate counts per Source-1 entity.
-
-    Returns:
-    - total_candidate_pairs
-    - num_source1_entities
-    - avg_candidates_per_s1
-    - median_candidates_per_s1
-    - p90_candidates_per_s1
-    - p95_candidates_per_s1
-    - p99_candidates_per_s1
-    - max_candidates_per_s1
     """
 
     candidate_counts = np.array(
@@ -311,4 +286,46 @@ def calculate_candidate_distribution(
             np.max(candidate_counts)
         ),
     }
-    
+
+
+def label_candidate_pairs(
+    candidate_pairs: Iterable[tuple[str, str]],
+    ground_truth: GroundTruth,
+) -> list[dict[str, str | int]]:
+    """
+    Label generated candidate pairs using ground truth.
+
+    Each candidate pair is:
+
+        (source1_entity_id, candidate_entity_id)
+
+    Returns one dictionary per candidate:
+
+        {
+            "source1_entity_id": "S1-123",
+            "candidate_entity_id": "S2-456",
+            "label": 1,
+        }
+
+    Important:
+    A ground-truth match that is absent from candidate_pairs is NOT
+    returned as label=0. That case is a blocking/retrieval failure
+    and must be measured separately.
+    """
+
+    labeled_pairs: list[dict[str, str | int]] = []
+
+    for source1_id, candidate_id in candidate_pairs:
+        true_matches = ground_truth.get(source1_id, set())
+
+        label = 1 if candidate_id in true_matches else 0
+
+        labeled_pairs.append(
+            {
+                "source1_entity_id": source1_id,
+                "candidate_entity_id": candidate_id,
+                "label": label,
+            }
+        )
+
+    return labeled_pairs

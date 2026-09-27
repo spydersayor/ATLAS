@@ -36,6 +36,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
+import re
+import pickle
+import tempfile
 
 import pandas as pd
 
@@ -77,11 +80,34 @@ BLOCKER_ADDRESS_EXACT = "address_exact"
 BLOCKER_NAME_COUNTRY = "name_country"
 BLOCKER_ADDRESS_COUNTRY = "address_country"
 
+BLOCKER_NAME_TOKEN = "name_token_country"
+BLOCKER_NAME_PREFIX = "name_prefix_country"
+BLOCKER_ADDRESS_TOKEN = "address_token_country"
+BLOCKER_ADDRESS_PREFIX = "address_prefix_country"
+
+BLOCKER_NAME_TOKEN_PAIR = "name_token_pair_country"
+BLOCKER_ADDRESS_TOKEN_PAIR = "address_token_pair_country"
+
+BLOCKER_NAME_NGRAM = "name_ngram_country"
+BLOCKER_ADDRESS_NGRAM = "address_ngram_country"
+
+# Simple, uncapped-key (no country component) high-recall token blocker
+# over normalized business names. Named *_SIMPLE to avoid colliding with
+# the existing BLOCKER_NAME_TOKEN ("name_token_country") constant above.
+BLOCKER_NAME_TOKEN_SIMPLE = "name_token"
+
 BLOCKER_NAMES = (
     BLOCKER_NAME_EXACT,
     BLOCKER_ADDRESS_EXACT,
     BLOCKER_NAME_COUNTRY,
     BLOCKER_ADDRESS_COUNTRY,
+    BLOCKER_NAME_TOKEN,
+    BLOCKER_NAME_PREFIX,
+    BLOCKER_ADDRESS_TOKEN,
+    BLOCKER_ADDRESS_PREFIX,
+    BLOCKER_NAME_TOKEN_PAIR,
+    BLOCKER_ADDRESS_TOKEN_PAIR,
+    BLOCKER_NAME_TOKEN_SIMPLE,
 )
 
 
@@ -92,19 +118,59 @@ BLOCKER_NAMES = (
 @dataclass(frozen=True)
 class BlockingConfig:
     """
-    Configuration for candidate generation.
+    Configuration for deterministic multi-strategy blocking.
 
-    The current baseline intentionally uses exact deterministic
-    retrieval keys only.
-
-    Token/approximate blockers will be added separately after
-    candidate-volume benchmarking.
+    Token/prefix blockers are frequency-capped so that common
+    tokens do not create an uncontrolled candidate explosion.
     """
 
+    # Existing exact blockers
     enable_name_exact: bool = True
     enable_address_exact: bool = True
     enable_name_country: bool = True
     enable_address_country: bool = True
+
+    # New bounded blockers
+    enable_name_token_country: bool = True
+    enable_name_prefix_country: bool = True
+    enable_address_token_country: bool = True
+    enable_address_prefix_country: bool = True
+
+    # Token-pair blockers
+    enable_name_token_pair_country: bool = True
+    enable_address_token_pair_country: bool = True
+
+    # Safety controls
+    min_token_length: int = 3
+    max_token_signatures_per_record: int = 3
+
+    # Minimum token length considered when building the order-independent
+    # two-token pair signature used by the *_token_pair_country blockers.
+    pair_min_token_length: int = 2
+
+    # Ignore signatures that occur too frequently in target data
+    max_signature_frequency: int = 100
+
+    # Prefix length used by prefix blocking
+    prefix_length: int = 4
+
+    # Number of source1 rows processed per chunk in _run_signature_block,
+    # so per-blocker candidate output is never held in memory for the
+    # entire source1 dataset at once.
+    source1_chunk_size: int = 100_000
+
+    # Simple, no-country, high-recall token blocker over
+    # business_name_normalized. Complements name_token_country: no
+    # country key, but tightened to reuse max_signature_frequency for its
+    # postings cap (not a separate 1%-of-target formula), filter common
+    # business stopwords, and require a longer minimum token length.
+    enable_name_token: bool = True
+
+    # Minimum token length for the name_token blocker specifically.
+    # Raised above min_token_length (3) because this blocker has no
+    # country key, so short tokens are far more likely to collide
+    # across unrelated businesses.
+    name_token_min_length: int = 4
 
 
 # ============================================================================
@@ -278,6 +344,127 @@ def _clean_key_series(
     )
 
 
+_TOKEN_PATTERN = re.compile(r"[^\W_]+", flags=re.UNICODE)
+
+
+def _tokenize(value: str) -> list[str]:
+    if not value:
+        return []
+    return _TOKEN_PATTERN.findall(str(value))
+
+
+def _valid_tokens(value: str, min_length: int) -> list[str]:
+    return [
+        token
+        for token in _tokenize(value)
+        if len(token) >= min_length
+    ]
+
+
+def _token_signature(value: str, min_length: int) -> str:
+    tokens = _valid_tokens(value, min_length)
+
+    if not tokens:
+        return ""
+
+    return sorted(
+        tokens,
+        key=lambda token: (-len(token), token)
+    )[0]
+
+
+def _token_signatures(
+    value: str,
+    min_length: int,
+    max_signatures: int,
+) -> list[str]:
+    """
+    Return multiple deterministic token signatures.
+
+    Longer tokens are preferred because they are generally more
+    discriminative than short/common tokens.
+    """
+    tokens = sorted(
+        set(_valid_tokens(value, min_length)),
+        key=lambda token: (-len(token), token),
+    )
+
+    return tokens[:max_signatures]
+
+
+# Common legal/business suffix tokens that are too generic to be
+# discriminative on their own. Shared by the token-pair blockers and the
+# no-country-key name_token blocker.
+_COMMON_BUSINESS_STOPWORDS = {
+    "ltd",
+    "limited",
+    "llc",
+    "inc",
+    "incorporated",
+    "corp",
+    "corporation",
+    "co",
+    "company",
+    "pvt",
+    "private",
+    "plc",
+    "llp",
+    "lp",
+    "services",
+    "service",
+}
+
+
+def _token_pair_signature(
+    value: str,
+    min_token_length: int,
+) -> str:
+    """
+    Return one deterministic, order-independent pair of informative tokens.
+
+    The two longest distinct valid tokens are selected. Common legal/business
+    suffix tokens are excluded so the pair remains reasonably discriminative.
+    """
+
+    tokens = {
+        token
+        for token in _valid_tokens(
+            value,
+            min_token_length,
+        )
+        if token.lower() not in _COMMON_BUSINESS_STOPWORDS
+    }
+
+    if len(tokens) < 2:
+        return ""
+
+    selected = sorted(
+        tokens,
+        key=lambda token: (-len(token), token),
+    )[:2]
+
+    # Order-independent pair.
+    selected = sorted(selected)
+
+    return "\x1e".join(selected)
+
+
+def _prefix_signature(
+    value: str,
+    min_length: int,
+    prefix_length: int,
+) -> str:
+    token = _token_signature(value, min_length)
+
+    if not token:
+        return ""
+
+    if len(token) <= prefix_length:
+        return token
+
+    return token[:prefix_length]
+
+
 def _make_composite_key(
     left: pd.Series,
     right: pd.Series,
@@ -391,6 +578,18 @@ def _run_single_key_block(
     if merged.empty:
         return _empty_candidate_frame()
 
+    # Defensive dedup: entity_id is validated unique per source, so an
+    # exact-key merge should not be able to produce duplicate
+    # (source1_entity_id, candidate_entity_id) pairs. Guard against it
+    # anyway rather than trusting that assumption silently.
+    merged = merged.drop_duplicates(
+        subset=["entity_id_s1", "entity_id_candidate"]
+    )
+
+    assert not merged.duplicated(
+        subset=["entity_id_s1", "entity_id_candidate"]
+    ).any()
+
     result = pd.DataFrame(
         {
             "source1_entity_id": merged["entity_id_s1"],
@@ -491,6 +690,17 @@ def _run_composite_block(
     if merged.empty:
         return _empty_candidate_frame()
 
+    # Defensive dedup: same rationale as _run_single_key_block -- entity_id
+    # uniqueness per source means this shouldn't produce duplicate pairs,
+    # but assert it rather than assume it.
+    merged = merged.drop_duplicates(
+        subset=["entity_id_s1", "entity_id_candidate"]
+    )
+
+    assert not merged.duplicated(
+        subset=["entity_id_s1", "entity_id_candidate"]
+    ).any()
+
     result = pd.DataFrame(
         {
             "source1_entity_id": merged["entity_id_s1"],
@@ -538,28 +748,31 @@ def fuse_candidate_pairs(
     candidate_frames: Iterable[pd.DataFrame],
 ) -> pd.DataFrame:
     """
-    Fuse candidates generated by multiple blockers.
+    Fuse candidate-pair frames while keeping blocker provenance.
 
-    If the same pair is retrieved by multiple blockers, only one
-    candidate row survives.
+    Uses a compact uint16 bitmask instead of expanding blocker_sources
+    into Python lists. This is substantially more memory-efficient for
+    large candidate sets.
 
-    Example:
+    Each blocker is represented by one bit:
+        name_exact                  -> 1
+        address_exact               -> 2
+        name_country                -> 4
+        address_country             -> 8
+        name_token_country          -> 16
+        name_prefix_country         -> 32
+        address_token_country       -> 64
+        address_prefix_country      -> 128
+        name_token_pair_country     -> 256
+        address_token_pair_country  -> 512
+        name_token                  -> 1024
 
-        pair A
-            name_exact
-            address_exact
-            name_country
-
-    becomes:
-
-        blocker_sources =
-            "address_exact,name_country,name_exact"
-
-        num_blockers = 3
-
-    Provenance is stored as a deterministic comma-separated string
-    because Sayor's downstream feature module accepts comma-separated
-    blocker representations.
+    The public output contract remains unchanged:
+        source1_entity_id
+        candidate_entity_id
+        candidate_source
+        blocker_sources
+        num_blockers
     """
 
     frames = [
@@ -571,72 +784,174 @@ def fuse_candidate_pairs(
     if not frames:
         return _empty_candidate_frame()
 
-    combined = pd.concat(
-        frames,
-        ignore_index=True,
-    )
-
-    if combined.empty:
-        return _empty_candidate_frame()
-
     key_columns = [
         "source1_entity_id",
         "candidate_entity_id",
         "candidate_source",
     ]
 
-    # Normalize blocker representation.
-    combined["blocker_sources"] = (
-        combined["blocker_sources"]
-        .fillna("")
-        .astype(str)
-        .map(
-            lambda value: [
-                blocker.strip()
-                for blocker in value.split(",")
-                if blocker.strip()
-            ]
+    blocker_bits = {
+        "name_exact": 1,
+        "address_exact": 2,
+        "name_country": 4,
+        "address_country": 8,
+        "name_token_country": 16,
+        "name_prefix_country": 32,
+        "address_token_country": 64,
+        "address_prefix_country": 128,
+        "name_token_pair_country": 256,
+        "address_token_pair_country": 512,
+        "name_token": 1024,
+    }
+
+    compact_frames: list[pd.DataFrame] = []
+
+    for frame in frames:
+        missing_columns = [
+            column
+            for column in key_columns + ["blocker_sources"]
+            if column not in frame.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                f"Candidate frame is missing required columns: {missing_columns}"
+            )
+
+        # Defensive dedup: each individual blocker call is expected to
+        # already emit at most one row per (source1_entity_id,
+        # candidate_entity_id, candidate_source) -- but fuse here on the
+        # raw per-frame input too, since a groupby-sum over a duplicated
+        # mask would silently double-count that blocker's bit.
+        frame = frame.drop_duplicates(subset=key_columns)
+
+        blocker_values = (
+            frame["blocker_sources"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
         )
+
+        masks = pd.Series(
+            0,
+            index=frame.index,
+            dtype="uint16",
+        )
+
+        for blocker_name, bit in blocker_bits.items():
+            matches = blocker_values.str.contains(
+                rf"(?:^|,){blocker_name}(?:,|$)",
+                regex=True,
+                na=False,
+            )
+
+            masks = (
+                masks
+                | matches.astype("uint16") * bit
+            )
+
+        if masks.eq(0).any():
+            raise ValueError(
+                "Candidate frame contains an empty or invalid blocker_sources value."
+            )
+
+        compact = frame[
+            key_columns
+        ].copy()
+
+        compact["blocker_mask"] = masks.to_numpy(
+            dtype="uint16",
+            copy=False,
+        )
+
+        compact_frames.append(compact)
+
+    combined = pd.concat(
+        compact_frames,
+        ignore_index=True,
+        copy=False,
     )
 
-    # Aggregate all blocker provenance for each unique pair.
+    if combined.empty:
+        return _empty_candidate_frame()
+
+    # Each generated blocker frame contributes a blocker at most once
+    # for a given candidate pair (enforced by the per-frame drop_duplicates
+    # above). Therefore, because blocker bits are powers of two, summing
+    # the masks is equivalent to bitwise OR.
     fused = (
         combined
         .groupby(
             key_columns,
             sort=False,
             dropna=False,
+            as_index=False,
+        )["blocker_mask"]
+        .sum()
+    )
+
+    if fused["blocker_mask"].gt(2047).any():
+        raise ValueError(
+            "Invalid blocker mask detected during candidate fusion."
         )
-        .agg(
-            blocker_sources=(
-                "blocker_sources",
-                lambda groups: sorted(
-                    {
-                        blocker
-                        for group in groups
-                        for blocker in group
-                    }
-                ),
-            )
-        )
-        .reset_index()
+
+    blocker_order = [
+        "address_country",
+        "address_exact",
+        "address_prefix_country",
+        "address_token_country",
+        "address_token_pair_country",
+        "name_country",
+        "name_exact",
+        "name_prefix_country",
+        "name_token",
+        "name_token_country",
+        "name_token_pair_country",
+    ]
+
+    mask_to_sources = {}
+
+    for mask in range(1, 2048):
+        sources = [
+            blocker
+            for blocker in blocker_order
+            if mask & blocker_bits[blocker]
+        ]
+
+        mask_to_sources[mask] = ",".join(sources)
+
+    fused["blocker_mask"] = fused["blocker_mask"].astype("uint16")
+
+    fused["blocker_sources"] = fused["blocker_mask"].map(
+        mask_to_sources
     )
 
     fused["num_blockers"] = (
-        fused["blocker_sources"]
-        .map(len)
+        fused["blocker_mask"]
+        .map(lambda mask: int(mask).bit_count())
         .astype("int64")
     )
 
-    # Downstream Sayor feature code accepts comma-separated
-    # blocker representations.
-    fused["blocker_sources"] = (
-        fused["blocker_sources"]
-        .map(",".join)
-        .astype("string")
+    fused = fused.drop(
+        columns=["blocker_mask"]
     )
 
-    # Deterministic ordering.
+    fused = fused[
+        [
+            "source1_entity_id",
+            "candidate_entity_id",
+            "candidate_source",
+            "blocker_sources",
+            "num_blockers",
+        ]
+    ]
+
+    # Final defensive check: after the groupby-sum fusion above, there
+    # must be exactly one row per (source1_entity_id, candidate_entity_id,
+    # candidate_source) key -- that's the entire point of the groupby.
+    # Assert it rather than silently trusting it.
+    assert not fused.duplicated(subset=key_columns).any()
+
     fused = fused.sort_values(
         by=[
             "source1_entity_id",
@@ -649,6 +964,478 @@ def fuse_candidate_pairs(
     validate_candidate_pairs(fused)
 
     return fused
+
+
+# ============================================================================
+# SIGNATURE-BASED (TOKEN / PREFIX) BLOCKER
+# ============================================================================
+
+def _run_signature_block(
+    source1: pd.DataFrame,
+    target: pd.DataFrame,
+    target_source: str,
+    value_column: str,
+    blocker_name: str,
+    config: BlockingConfig,
+) -> pd.DataFrame:
+    """Generate bounded token/prefix blocking candidates.
+
+    Uses a target-side inverted index and processes source1 signatures
+    without constructing a large exploded merge DataFrame.
+    """
+
+    if target_source not in {"S2", "S3"}:
+        raise ValueError(f"Unsupported target_source: {target_source}")
+
+    if value_column not in source1.columns or value_column not in target.columns:
+        raise KeyError(f"Missing blocking column: {value_column}")
+
+    # Determine whether this blocker uses token signatures or prefixes.
+    is_token_block = blocker_name in {
+        BLOCKER_NAME_TOKEN,
+        BLOCKER_ADDRESS_TOKEN,
+    }
+
+    is_prefix_block = blocker_name in {
+        BLOCKER_NAME_PREFIX,
+        BLOCKER_ADDRESS_PREFIX,
+    }
+
+    is_token_pair_block = blocker_name in {
+        BLOCKER_NAME_TOKEN_PAIR,
+        BLOCKER_ADDRESS_TOKEN_PAIR,
+    }
+
+    if not (
+        is_token_block
+        or is_prefix_block
+        or is_token_pair_block
+    ):
+        raise ValueError(
+            f"Unsupported signature blocker: {blocker_name}"
+        )
+
+    min_token_length = int(config.min_token_length)
+    max_signature_frequency = int(config.max_signature_frequency)
+    prefix_length = int(config.prefix_length)
+    max_token_signatures = int(config.max_token_signatures_per_record)
+
+    # ------------------------------------------------------------------
+    # Build target-side bounded inverted index.
+    # ------------------------------------------------------------------
+    target_work = target[
+        ["entity_id", value_column, "country_fingerprint"]
+    ].copy()
+
+    target_work[value_column] = target_work[value_column].fillna("").astype(str)
+    target_work["country_fingerprint"] = (
+        target_work["country_fingerprint"].fillna("").astype(str)
+    )
+
+    records: list[tuple[str, str, str]] = []
+
+    for entity_id, value, country in target_work.itertuples(index=False, name=None):
+        if is_token_block:
+            signatures = _token_signatures(
+                value,
+                min_token_length,
+                max_token_signatures,
+            )
+
+        elif is_token_pair_block:
+            pair_signature = _token_pair_signature(
+                value,
+                int(config.pair_min_token_length),
+            )
+
+            signatures = (
+                [pair_signature]
+                if pair_signature
+                else []
+            )
+
+        else:
+            prefix = _prefix_signature(
+                value,
+                min_token_length,
+                prefix_length,
+            )
+
+            signatures = [prefix] if prefix else []
+
+        for signature in signatures:
+            if not signature:
+                continue
+            records.append((signature, country, entity_id))
+
+    if not records:
+        return pd.DataFrame(
+            columns=[
+                "source1_entity_id",
+                "candidate_entity_id",
+                "candidate_source",
+                "blocker_sources",
+                "num_blockers",
+            ]
+        )
+
+    target_index = pd.DataFrame(
+        records,
+        columns=["signature", "country", "candidate_entity_id"],
+    )
+
+    # Frequency cap is applied to the actual blocking key.
+    target_index["blocking_key"] = (
+        target_index["signature"] + "\x1f" + target_index["country"]
+    )
+
+    frequencies = target_index["blocking_key"].value_counts()
+    allowed_keys = frequencies[
+        frequencies <= max_signature_frequency
+    ].index
+
+    target_index = target_index[
+        target_index["blocking_key"].isin(allowed_keys)
+    ][
+        ["signature", "country", "candidate_entity_id"]
+    ]
+
+    if target_index.empty:
+        return pd.DataFrame(
+            columns=[
+                "source1_entity_id",
+                "candidate_entity_id",
+                "candidate_source",
+                "blocker_sources",
+                "num_blockers",
+            ]
+        )
+
+    # Build compact Python dictionaries instead of doing a large pandas
+    # many-to-many merge.
+    index: dict[tuple[str, str], list[str]] = {}
+
+    for signature, country, candidate_id in target_index.itertuples(
+        index=False,
+        name=None,
+    ):
+        key = (signature, country)
+        index.setdefault(key, []).append(candidate_id)
+
+    # ------------------------------------------------------------------
+    # Generate candidates source1-record by source1-record, in bounded
+    # chunks.
+    #
+    # IMPORTANT:
+    # Do NOT keep every chunk DataFrame in RAM. Each completed chunk is
+    # serialized to a temporary file and released before the next chunk.
+    # ------------------------------------------------------------------
+    source1_work = source1[
+        ["entity_id", value_column, "country_fingerprint"]
+    ].copy()
+
+    source1_work[value_column] = source1_work[value_column].fillna("").astype(str)
+    source1_work["country_fingerprint"] = (
+        source1_work["country_fingerprint"].fillna("").astype(str)
+    )
+
+    chunk_size = int(config.source1_chunk_size)
+    if chunk_size <= 0:
+        raise ValueError("source1_chunk_size must be a positive integer.")
+
+    output_columns = [
+        "source1_entity_id",
+        "candidate_entity_id",
+        "candidate_source",
+        "blocker_sources",
+        "num_blockers",
+    ]
+
+    temp_paths: list[str] = []
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="atlas_blocking_") as temp_dir:
+
+            for start in range(0, len(source1_work), chunk_size):
+                chunk = source1_work.iloc[start : start + chunk_size]
+
+                chunk_rows: list[tuple[str, str, str, str, int]] = []
+
+                for source1_id, value, country in chunk.itertuples(
+                    index=False,
+                    name=None,
+                ):
+                    if is_token_block:
+                        signatures = _token_signatures(
+                            value,
+                            min_token_length,
+                            max_token_signatures,
+                        )
+
+                    elif is_token_pair_block:
+                        pair_signature = _token_pair_signature(
+                            value,
+                            int(config.pair_min_token_length),
+                        )
+
+                        signatures = (
+                            [pair_signature]
+                            if pair_signature
+                            else []
+                        )
+
+                    else:
+                        prefix = _prefix_signature(
+                            value,
+                            min_token_length,
+                            prefix_length,
+                        )
+
+                        signatures = [prefix] if prefix else []
+
+                    if not signatures:
+                        continue
+
+                    # Deduplicate candidates within this blocker
+                    # for the current Source1 record.
+                    candidate_ids: set[str] = set()
+
+                    for signature in signatures:
+                        if not signature:
+                            continue
+
+                        matches = index.get((signature, country))
+
+                        if matches:
+                            candidate_ids.update(matches)
+
+                    for candidate_id in candidate_ids:
+                        chunk_rows.append(
+                            (
+                                source1_id,
+                                candidate_id,
+                                target_source,
+                                blocker_name,
+                                1,
+                            )
+                        )
+
+                if not chunk_rows:
+                    continue
+
+                chunk_df = pd.DataFrame(
+                    chunk_rows,
+                    columns=output_columns,
+                )
+
+                # Write the completed chunk to disk instead of retaining
+                # it in RAM.
+                temp_path = f"{temp_dir}/chunk_{start}.pkl"
+
+                with open(temp_path, "wb") as handle:
+                    pickle.dump(
+                        chunk_df,
+                        handle,
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
+
+                temp_paths.append(temp_path)
+
+                # Explicitly release the current chunk objects.
+                del chunk_df
+                del chunk_rows
+                del chunk
+
+            if not temp_paths:
+                return pd.DataFrame(columns=output_columns)
+
+            # Reconstruct the final blocker DataFrame from the temporary
+            # chunk files. The large Python list of tuples from all chunks
+            # never exists in memory at the same time.
+            result_frames: list[pd.DataFrame] = []
+
+            for temp_path in temp_paths:
+                with open(temp_path, "rb") as handle:
+                    result_frames.append(pickle.load(handle))
+
+            result = pd.concat(
+                result_frames,
+                ignore_index=True,
+                copy=False,
+            )
+
+            del result_frames
+
+            # Defensive dedup: chunks are built from disjoint source1
+            # index ranges and candidate_ids is already deduped per
+            # source1 record, so this shouldn't fire -- but assert it
+            # rather than trust it silently across chunk boundaries.
+            result = result.drop_duplicates(
+                subset=["source1_entity_id", "candidate_entity_id"]
+            )
+
+            assert not result.duplicated(
+                subset=["source1_entity_id", "candidate_entity_id"]
+            ).any()
+
+            return result
+
+    finally:
+        # TemporaryDirectory normally handles cleanup automatically.
+        # Keep this block intentionally empty so cleanup remains managed
+        # by the context manager.
+        pass
+
+
+# ============================================================================
+# SIMPLE NAME-TOKEN BLOCKER (NO COUNTRY KEY, HIGH RECALL)
+# ============================================================================
+
+def _run_name_token_block(
+    source1: pd.DataFrame,
+    target: pd.DataFrame,
+    target_source: str,
+    config: BlockingConfig,
+) -> pd.DataFrame:
+    """
+    Generate candidates using shared business-name tokens.
+
+    Uses an inverted index over normalized business names.
+
+    Unlike name_token_country, this blocker has no country component
+    in its key and is intentionally looser/higher-recall than the other
+    signature blockers -- but it is tightened along three axes so it
+    does not dominate the candidate set:
+
+      1. Postings cap reuses config.max_signature_frequency (the same
+         cap every other signature blocker uses), instead of a looser
+         1%-of-target-size formula.
+      2. Common business-suffix stopwords (ltd, inc, corp, company,
+         services, ...) are excluded, matching the token-pair blockers.
+      3. Minimum token length is config.name_token_min_length (default
+         4, above the other blockers' default of 3), since a token with
+         no country key needs to be more discriminative on its own.
+
+    Requires business_name_normalized (produced upstream by
+    normalization, before fingerprinting) on both source1 and target.
+    """
+
+    blocker_name = BLOCKER_NAME_TOKEN_SIMPLE
+
+    required = {
+        "business_name_normalized",
+    }
+
+    missing = required - set(source1.columns)
+    if missing:
+        raise ValueError(
+            f"source1 is missing columns required for "
+            f"{blocker_name}: {sorted(missing)}"
+        )
+
+    missing = required - set(target.columns)
+    if missing:
+        raise ValueError(
+            f"{target_source} is missing columns required for "
+            f"{blocker_name}: {sorted(missing)}"
+        )
+
+    min_length = int(config.name_token_min_length)
+
+    def _significant_tokens(name: str) -> set[str]:
+        return {
+            token
+            for token in str(name).split()
+            if len(token) >= min_length
+            and token.lower() not in _COMMON_BUSINESS_STOPWORDS
+        }
+
+    # ------------------------------------------------------------
+    # Build target inverted index.
+    # token -> target entity IDs
+    # ------------------------------------------------------------
+
+    target_index: dict[str, list[str]] = {}
+
+    for row in target[
+        ["entity_id", "business_name_normalized"]
+    ].itertuples(index=False):
+
+        entity_id, name = row
+
+        for token in _significant_tokens(name):
+            target_index.setdefault(token, []).append(
+                str(entity_id)
+            )
+
+    if not target_index:
+        return _empty_candidate_frame()
+
+    # Ignore tokens more frequent than the shared blocking-frequency cap,
+    # same bound used by every other signature blocker.
+    max_postings = max(
+        1,
+        int(config.max_signature_frequency),
+    )
+
+    target_index = {
+        token: ids
+        for token, ids in target_index.items()
+        if len(ids) <= max_postings
+    }
+
+    rows = []
+
+    for row in source1[
+        ["entity_id", "business_name_normalized"]
+    ].itertuples(index=False):
+
+        source1_id, name = row
+
+        candidates = set()
+
+        for token in _significant_tokens(name):
+            candidates.update(
+                target_index.get(token, [])
+            )
+
+        for candidate_id in candidates:
+            rows.append(
+                {
+                    "source1_entity_id": str(source1_id),
+                    "candidate_entity_id": str(candidate_id),
+                    "candidate_source": target_source,
+                    "blocker_sources": blocker_name,
+                }
+            )
+
+    if not rows:
+        return _empty_candidate_frame()
+
+    result = pd.DataFrame(rows)
+
+    # Defensive dedup: `candidates` is already a per-source1-record set,
+    # so duplicate (source1_id, candidate_id) pairs shouldn't occur --
+    # assert it rather than trust it.
+    result = result.drop_duplicates(
+        subset=["source1_entity_id", "candidate_entity_id"]
+    )
+
+    assert not result.duplicated(
+        subset=["source1_entity_id", "candidate_entity_id"]
+    ).any()
+
+    result["num_blockers"] = 1
+
+    return result[
+        [
+            "source1_entity_id",
+            "candidate_entity_id",
+            "candidate_source",
+            "blocker_sources",
+            "num_blockers",
+        ]
+    ]
 
 
 # ============================================================================
@@ -772,6 +1559,101 @@ def generate_candidates_for_target(
                 left_column="address_fingerprint",
                 right_column="country_fingerprint",
                 blocker_name=BLOCKER_ADDRESS_COUNTRY,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # name_token (simple, no country key, high recall)
+    # ------------------------------------------------------------------
+
+    if config.enable_name_token:
+        blocker_frames.append(
+            _run_name_token_block(
+                source1=source1,
+                target=target,
+                target_source=target_source,
+                config=config,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # name_token_country / name_prefix_country /
+    # address_token_country / address_prefix_country
+    # ------------------------------------------------------------------
+
+    if config.enable_name_token_country:
+        blocker_frames.append(
+            _run_signature_block(
+                source1=source1,
+                target=target,
+                target_source=target_source,
+                value_column="business_name",
+                blocker_name=BLOCKER_NAME_TOKEN,
+                config=config,
+            )
+        )
+
+    if config.enable_name_prefix_country:
+        blocker_frames.append(
+            _run_signature_block(
+                source1=source1,
+                target=target,
+                target_source=target_source,
+                value_column="business_name",
+                blocker_name=BLOCKER_NAME_PREFIX,
+                config=config,
+            )
+        )
+
+    if config.enable_address_token_country:
+        blocker_frames.append(
+            _run_signature_block(
+                source1=source1,
+                target=target,
+                target_source=target_source,
+                value_column="business_address",
+                blocker_name=BLOCKER_ADDRESS_TOKEN,
+                config=config,
+            )
+        )
+
+    if config.enable_address_prefix_country:
+        blocker_frames.append(
+            _run_signature_block(
+                source1=source1,
+                target=target,
+                target_source=target_source,
+                value_column="business_address",
+                blocker_name=BLOCKER_ADDRESS_PREFIX,
+                config=config,
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # name_token_pair_country / address_token_pair_country
+    # ------------------------------------------------------------------
+
+    if config.enable_name_token_pair_country:
+        blocker_frames.append(
+            _run_signature_block(
+                source1=source1,
+                target=target,
+                target_source=target_source,
+                value_column="business_name",
+                blocker_name=BLOCKER_NAME_TOKEN_PAIR,
+                config=config,
+            )
+        )
+
+    if config.enable_address_token_pair_country:
+        blocker_frames.append(
+            _run_signature_block(
+                source1=source1,
+                target=target,
+                target_source=target_source,
+                value_column="business_address",
+                blocker_name=BLOCKER_ADDRESS_TOKEN_PAIR,
+                config=config,
             )
         )
 

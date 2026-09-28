@@ -1,0 +1,87 @@
+
+======================================================================
+BLOCKER COUNTS FOR S2
+======================================================================
+name_exact                              7,416 candidates
+address_exact                             477 candidates
+name_country                            7,394 candidates
+address_country                           477 candidates
+name_soundex_country                    2,134 candidates
+name_token_pair_country                21,422 candidates
+address_token_pair_country                741 candidates
+======================================================================
+
+======================================================================
+BLOCKER COUNTS FOR S3
+======================================================================
+name_exact                              8,190 candidates
+address_exact                             175 candidates
+name_country                            8,179 candidates
+address_country                           175 candidates
+name_soundex_country                    1,960 candidates
+name_token_pair_country                29,579 candidates
+address_token_pair_country             17,679 candidates
+======================================================================
+S1: 2000  S2: 5034616  S3: 5285603
+Total fused candidates: 82675
+
+======================================================================
+PART 1: Per-blocker overlap / redundancy
+======================================================================
+blocker                           touches  unique_only  pct_unique
+name_exact                          15606           33        0.2%
+address_exact                         652            0        0.0%
+name_country                        15573            0        0.0%
+address_country                       652            0        0.0%
+name_token_country                      0            0          --
+name_prefix_country                     0            0          --
+address_token_country                   0            0          --
+address_prefix_country                  0            0          --
+name_token_pair_country             51001        44381       87.0%
+address_token_pair_country          18420        17778       96.5%
+name_token                              0            0          --
+name_soundex_country                 4094         4018       98.1%
+
+======================================================================
+PART 2: Blocking recall vs ground truth
+======================================================================
+S1 records in this slice: 2000
+Total true match pairs (all targets, incl. outside this slice): 6986
+S1 records with >=1 true match: 1883
+S1 records that are true singletons (no match anywhere): 117
+
+True-match target resolution against the loaded S2/S3 slices:
+{'S3': 3605, 'S2': 3381}
+
+NOTE: NOT_IN_SLICE true matches cannot possibly be found here -- their real match exists somewhere in the full dataset, outside this truncated sample. That's a sampling artifact, not a blocking failure. Recall below is reported both ways.
+
+Blocking recall (over targets present in this slice): 0.5938  (4148/6986)
+Blocking recall (over ALL true matches, incl. out-of-slice): 0.5938  (4148/6986)
+
+======================================================================
+PART 2.5: MISSED TRUE-PAIR DIAGNOSTICS
+======================================================================
+Missed coverable true pairs: 2,838
+Saved diagnostics to: missed_true_pairs_diagnostics.tsv
+
+First 30 missed true pairs:
+
+Traceback (most recent call last):
+  File "C:\Users\Spyder\Desktop\ATLAS\measure_blocking_recall.py", line 434, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\Spyder\Desktop\ATLAS\measure_blocking_recall.py", line 374, in main
+    print(
+    ~~~~~^
+        missed_diagnostics.head(30).to_string(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+            index=False
+            ^^^^^^^^^^^
+        )
+        ^
+    )
+    ^
+  File "C:\Program Files\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 7389-7396: character maps to <undefined>

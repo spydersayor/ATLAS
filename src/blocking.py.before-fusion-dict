@@ -96,23 +96,6 @@ BLOCKER_ADDRESS_NGRAM = "address_ngram_country"
 # the existing BLOCKER_NAME_TOKEN ("name_token_country") constant above.
 BLOCKER_NAME_TOKEN_SIMPLE = "name_token"
 
-# Phonetic (Soundex) blocker over business-name tokens + country.
-#
-# WHY THIS EXISTS:
-# Missed-pair diagnostics (measure_blocking_recall.py Part 2.5) showed a
-# recurring failure class that no exact/token/prefix blocker can catch:
-# single-character typos and OCR-style corruption that still SOUND the
-# same -- "Seraices" vs "Services", "Cfaan" vs "Clean", "Zejgang" vs
-# "Zhejiang", "Seaffng" vs "Staffing". Token-exact and prefix blockers
-# require the literal characters to line up; Soundex reduces a word to
-# a phonetic code (first letter + a digit code for its consonant
-# sounds), so words that sound alike collapse to the same key even when
-# several characters differ. This is pure-Python (no extra dependency)
-# and reuses the existing signature-block infrastructure (chunking,
-# disk-spill, per-key frequency cap) -- it is not a new code path, just
-# a new signature function fed into _run_signature_block.
-BLOCKER_NAME_SOUNDEX = "name_soundex_country"
-
 BLOCKER_NAMES = (
     BLOCKER_NAME_EXACT,
     BLOCKER_ADDRESS_EXACT,
@@ -125,7 +108,6 @@ BLOCKER_NAMES = (
     BLOCKER_NAME_TOKEN_PAIR,
     BLOCKER_ADDRESS_TOKEN_PAIR,
     BLOCKER_NAME_TOKEN_SIMPLE,
-    BLOCKER_NAME_SOUNDEX,
 )
 
 
@@ -169,23 +151,6 @@ class BlockingConfig:
     # Ignore signatures that occur too frequently in target data
     max_signature_frequency: int = 100
 
-    # Frequency cap for the exact/composite blockers (name_exact,
-    # address_exact, name_country, address_country).
-    #
-    # WHY THIS EXISTS:
-    # Unlike the signature blockers, these four had NO cap at all. At a
-    # small test slice (a few thousand target rows) a shared fingerprint
-    # value rarely has enough postings to matter. At full scale (millions
-    # of target rows), a single S1 record whose fingerprint happens to be
-    # common (a generic normalized name, a short/degenerate address
-    # fingerprint, etc.) can match thousands of target rows -- and that's
-    # exactly what produced a ~150M-row candidate set from only 2,000 S1
-    # records. This reuses the same semantics as max_signature_frequency:
-    # any blocking key occurring more than this many times on the target
-    # side is dropped entirely for that key (for every S1 record that
-    # would have matched it), rather than emitting an unbounded fan-out.
-    max_exact_key_frequency: int = 100
-
     # Prefix length used by prefix blocking
     prefix_length: int = 4
 
@@ -206,13 +171,6 @@ class BlockingConfig:
     # country key, so short tokens are far more likely to collide
     # across unrelated businesses.
     name_token_min_length: int = 4
-
-    # Phonetic (Soundex) blocker over business-name tokens + country.
-    # See BLOCKER_NAME_SOUNDEX above for why this exists. Uses the same
-    # min_token_length / max_token_signatures_per_record / country-key /
-    # max_signature_frequency machinery as the other signature blockers
-    # -- no separate tuning knobs needed.
-    enable_name_soundex_country: bool = True
 
 
 # ============================================================================
@@ -491,85 +449,6 @@ def _token_pair_signature(
     return "\x1e".join(selected)
 
 
-# Standard Soundex consonant-group codes.
-_SOUNDEX_CODES = {
-    "B": "1", "F": "1", "P": "1", "V": "1",
-    "C": "2", "G": "2", "J": "2", "K": "2",
-    "Q": "2", "S": "2", "X": "2", "Z": "2",
-    "D": "3", "T": "3",
-    "L": "4",
-    "M": "5", "N": "5",
-    "R": "6",
-}
-
-
-def _soundex(token: str) -> str:
-    """
-    Standard 4-character Soundex code for one token (letter + 3 digits).
-
-    Vowels and H/W/Y map to no code and are skipped; consecutive letters
-    that map to the same code collapse to one digit (so "ll" and "l"
-    produce the same code, matching standard Soundex behavior). Returns
-    "" for a token with no letters at all.
-    """
-
-    letters = re.sub(r"[^A-Za-z]", "", token).upper()
-
-    if not letters:
-        return ""
-
-    first_letter = letters[0]
-    digits: list[str] = []
-    previous_code = _SOUNDEX_CODES.get(first_letter, "")
-
-    for char in letters[1:]:
-        code = _SOUNDEX_CODES.get(char, "")
-
-        if code and code != previous_code:
-            digits.append(code)
-
-        previous_code = code
-
-    return (first_letter + "".join(digits) + "000")[:4]
-
-
-def _soundex_signatures(
-    value: str,
-    min_length: int,
-    max_signatures: int,
-) -> list[str]:
-    """
-    Return deterministic Soundex codes for the most discriminative
-    tokens in value (mirrors _token_signatures' token selection: the
-    longest, most distinctive tokens first), deduplicated.
-
-    Common business-suffix stopwords are excluded -- "Inc"/"LLC"/etc.
-    all soundex to short, extremely common codes that would otherwise
-    dominate the postings for this key and get capped out anyway.
-    """
-
-    tokens = sorted(
-        {
-            token
-            for token in _valid_tokens(value, min_length)
-            if token.lower() not in _COMMON_BUSINESS_STOPWORDS
-        },
-        key=lambda token: (-len(token), token),
-    )[:max_signatures]
-
-    codes: list[str] = []
-    seen: set[str] = set()
-
-    for token in tokens:
-        code = _soundex(token)
-
-        if code and code not in seen:
-            seen.add(code)
-            codes.append(code)
-
-    return codes
-
-
 def _prefix_signature(
     value: str,
     min_length: int,
@@ -639,41 +518,6 @@ def _prepare_target_index(
     return index.loc[valid].copy()
 
 
-def _apply_key_frequency_cap(
-    target_index: pd.DataFrame,
-    key_column: str,
-    max_frequency: int,
-) -> pd.DataFrame:
-    """
-    Drop target rows whose blocking key occurs more than max_frequency
-    times in the target-side index.
-
-    This is the same principle _run_signature_block already applies via
-    its "blocking_key" frequency cap -- but it was previously missing
-    entirely from the exact/composite blockers (_run_single_key_block /
-    _run_composite_block). At small test slices a shared key rarely has
-    enough postings for this to matter; at full-scale data (millions of
-    target rows) an uncapped common key can fan out into an unbounded
-    number of candidates for every S1 record that shares it. Applying
-    the same bounded-postings discipline here keeps every blocker's
-    worst-case candidate volume bounded, not just the signature-based
-    ones.
-    """
-
-    if max_frequency <= 0 or target_index.empty:
-        return target_index
-
-    frequencies = target_index[key_column].value_counts()
-
-    allowed_keys = frequencies[
-        frequencies <= max_frequency
-    ].index
-
-    return target_index[
-        target_index[key_column].isin(allowed_keys)
-    ].copy()
-
-
 # ============================================================================
 # INDIVIDUAL BLOCKERS
 # ============================================================================
@@ -684,7 +528,6 @@ def _run_single_key_block(
     target_source: str,
     key_column: str,
     blocker_name: str,
-    max_exact_key_frequency: int,
 ) -> pd.DataFrame:
     """
     Execute one exact-key blocker.
@@ -693,11 +536,6 @@ def _run_single_key_block(
         source1.name_fingerprint
             ↔
         source2.name_fingerprint
-
-    Target-side keys occurring more than max_exact_key_frequency times
-    are dropped before the merge (see _apply_key_frequency_cap) so that
-    an unusually common fingerprint value cannot fan out into an
-    unbounded number of candidates at full data scale.
 
     Returns only:
         source1_entity_id
@@ -714,12 +552,6 @@ def _run_single_key_block(
     target_index = _prepare_target_index(
         target,
         [key_column],
-    )
-
-    target_index = _apply_key_frequency_cap(
-        target_index,
-        key_column,
-        max_exact_key_frequency,
     )
 
     s1[key_column] = _clean_key_series(
@@ -778,7 +610,6 @@ def _run_composite_block(
     left_column: str,
     right_column: str,
     blocker_name: str,
-    max_exact_key_frequency: int,
 ) -> pd.DataFrame:
     """
     Execute an exact composite-key blocker.
@@ -786,10 +617,7 @@ def _run_composite_block(
     Example:
         name_fingerprint + country_fingerprint
 
-    Only records with BOTH non-empty components participate. Target-side
-    composite keys occurring more than max_exact_key_frequency times are
-    dropped before the merge, for the same reason as
-    _run_single_key_block -- this blocker previously had no cap at all.
+    Only records with BOTH non-empty components participate.
     """
 
     s1 = source1[
@@ -845,15 +673,6 @@ def _run_composite_block(
         target_index[left_column],
         target_index[right_column],
     )
-
-    target_index = _apply_key_frequency_cap(
-        target_index,
-        "_blocking_key",
-        max_exact_key_frequency,
-    )
-
-    if target_index.empty:
-        return _empty_candidate_frame()
 
     merged = s1[
         ["entity_id", "_blocking_key"]
@@ -935,15 +754,6 @@ def fuse_candidate_pairs(
     into Python lists. This is substantially more memory-efficient for
     large candidate sets.
 
-    NOTE: this uses a vectorized pandas groupby-sum rather than a
-    per-row Python dict accumulator. With the frequency caps now applied
-    in _run_single_key_block / _run_composite_block (see
-    _apply_key_frequency_cap), candidate volume is bounded, and a
-    vectorized groupby is both faster and lower-memory than iterating
-    every row in Python -- building a Python dict with tens of millions
-    of tuple keys is itself a significant memory cost, on top of whatever
-    caused the candidate explosion in the first place.
-
     Each blocker is represented by one bit:
         name_exact                  -> 1
         address_exact               -> 2
@@ -956,7 +766,6 @@ def fuse_candidate_pairs(
         name_token_pair_country     -> 256
         address_token_pair_country  -> 512
         name_token                  -> 1024
-        name_soundex_country        -> 2048
 
     The public output contract remains unchanged:
         source1_entity_id
@@ -993,7 +802,6 @@ def fuse_candidate_pairs(
         "name_token_pair_country": 256,
         "address_token_pair_country": 512,
         "name_token": 1024,
-        "name_soundex_country": 2048,
     }
 
     compact_frames: list[pd.DataFrame] = []
@@ -1012,8 +820,8 @@ def fuse_candidate_pairs(
 
         # Defensive dedup: each individual blocker call is expected to
         # already emit at most one row per (source1_entity_id,
-        # candidate_entity_id, candidate_source) -- but dedupe the raw
-        # per-frame input too, since a groupby-sum over a duplicated
+        # candidate_entity_id, candidate_source) -- but fuse here on the
+        # raw per-frame input too, since a groupby-sum over a duplicated
         # mask would silently double-count that blocker's bit.
         frame = frame.drop_duplicates(subset=key_columns)
 
@@ -1024,23 +832,39 @@ def fuse_candidate_pairs(
             .str.strip()
         )
 
-        masks = pd.Series(
-            0,
-            index=frame.index,
-            dtype="uint16",
+        # Build the blocker bitmask in one pass per row instead of
+        # repeatedly scanning the entire column with regex.  The old
+        # implementation performed one pandas .str.contains(regex=True)
+        # scan for every blocker, which becomes extremely expensive on
+        # the full ATLAS candidate set.
+        def build_blocker_mask(value: str) -> int:
+            if not value:
+                return 0
+
+            mask = 0
+
+            for blocker_name in value.split(","):
+                blocker_name = blocker_name.strip()
+
+                if not blocker_name:
+                    continue
+
+                bit = blocker_bits.get(blocker_name)
+
+                if bit is None:
+                    raise ValueError(
+                        f"Unknown blocker name: {blocker_name!r}"
+                    )
+
+                mask |= bit
+
+            return mask
+
+        masks = (
+            blocker_values
+            .map(build_blocker_mask)
+            .astype("uint16")
         )
-
-        for blocker_name, bit in blocker_bits.items():
-            matches = blocker_values.str.contains(
-                rf"(?:^|,){blocker_name}(?:,|$)",
-                regex=True,
-                na=False,
-            )
-
-            masks = (
-                masks
-                | matches.astype("uint16") * bit
-            )
 
         if masks.eq(0).any():
             raise ValueError(
@@ -1058,31 +882,82 @@ def fuse_candidate_pairs(
 
         compact_frames.append(compact)
 
-    combined = pd.concat(
-        compact_frames,
-        ignore_index=True,
-        copy=False,
-    )
+        # ------------------------------------------------------------------
+    # MEMORY-SAFE FUSION
+    # ------------------------------------------------------------------
+    # Do NOT concatenate all blocker frames and then perform one giant
+    # pandas groupby().sum(). On the full dataset this can require an
+    # enormous temporary hash table and cause MemoryError.
+    #
+    # Instead, fuse blockers incrementally. Each blocker frame has already
+    # been deduplicated above, so each frame contributes its bit at most
+    # once for a candidate pair.
+    # ------------------------------------------------------------------
 
-    if combined.empty:
+    if not compact_frames:
         return _empty_candidate_frame()
 
-    # Each generated blocker frame contributes a blocker at most once
-    # for a given candidate pair (enforced by the per-frame drop_duplicates
-    # above). Therefore, because blocker bits are powers of two, summing
-    # the masks is equivalent to bitwise OR.
-    fused = (
-        combined
-        .groupby(
-            key_columns,
+    fused = None
+
+    for frame in compact_frames:
+        if frame.empty:
+            continue
+
+        if fused is None:
+            # First frame can be used directly as the initial accumulator.
+            fused = frame[
+                key_columns + ["blocker_mask"]
+            ].copy()
+
+            continue
+
+        # Only merge the current blocker against the already-fused pairs.
+        #
+        # A left merge is used so pairs appearing in either side are
+        # preserved. Existing and new masks are then OR'ed together.
+        merged = fused.merge(
+            frame,
+            on=key_columns,
+            how="outer",
             sort=False,
-            dropna=False,
-            as_index=False,
-        )["blocker_mask"]
-        .sum()
+            suffixes=("_old", "_new"),
+            copy=False,
+        )
+
+        old_mask = (
+            merged["blocker_mask_old"]
+            .fillna(0)
+            .astype("uint16")
+        )
+
+        new_mask = (
+            merged["blocker_mask_new"]
+            .fillna(0)
+            .astype("uint16")
+        )
+
+        merged["blocker_mask"] = (
+            old_mask | new_mask
+        ).astype("uint16")
+
+        fused = merged[
+            key_columns + ["blocker_mask"]
+        ].copy()
+
+        del merged
+        del old_mask
+        del new_mask
+
+    if fused is None or fused.empty:
+        return _empty_candidate_frame()
+
+    # Defensive duplicate check.
+    fused = fused.drop_duplicates(
+        subset=key_columns,
+        ignore_index=True,
     )
 
-    if fused["blocker_mask"].gt(4095).any():
+    if fused["blocker_mask"].gt(2047).any():
         raise ValueError(
             "Invalid blocker mask detected during candidate fusion."
         )
@@ -1096,7 +971,6 @@ def fuse_candidate_pairs(
         "name_country",
         "name_exact",
         "name_prefix_country",
-        "name_soundex_country",
         "name_token",
         "name_token_country",
         "name_token_pair_country",
@@ -1104,7 +978,7 @@ def fuse_candidate_pairs(
 
     mask_to_sources = {}
 
-    for mask in range(1, 4096):
+    for mask in range(1, 2048):
         sources = [
             blocker
             for blocker in blocker_order
@@ -1199,15 +1073,10 @@ def _run_signature_block(
         BLOCKER_ADDRESS_TOKEN_PAIR,
     }
 
-    is_soundex_block = blocker_name in {
-        BLOCKER_NAME_SOUNDEX,
-    }
-
     if not (
         is_token_block
         or is_prefix_block
         or is_token_pair_block
-        or is_soundex_block
     ):
         raise ValueError(
             f"Unsupported signature blocker: {blocker_name}"
@@ -1250,13 +1119,6 @@ def _run_signature_block(
                 [pair_signature]
                 if pair_signature
                 else []
-            )
-
-        elif is_soundex_block:
-            signatures = _soundex_signatures(
-                value,
-                min_token_length,
-                max_token_signatures,
             )
 
         else:
@@ -1387,13 +1249,6 @@ def _run_signature_block(
                             [pair_signature]
                             if pair_signature
                             else []
-                        )
-
-                    elif is_soundex_block:
-                        signatures = _soundex_signatures(
-                            value,
-                            min_token_length,
-                            max_token_signatures,
                         )
 
                     else:
@@ -1724,7 +1579,6 @@ def generate_candidates_for_target(
                 target_source=target_source,
                 key_column="name_fingerprint",
                 blocker_name=BLOCKER_NAME_EXACT,
-                max_exact_key_frequency=config.max_exact_key_frequency,
             )
         )
 
@@ -1740,7 +1594,6 @@ def generate_candidates_for_target(
                 target_source=target_source,
                 key_column="address_fingerprint",
                 blocker_name=BLOCKER_ADDRESS_EXACT,
-                max_exact_key_frequency=config.max_exact_key_frequency,
             )
         )
 
@@ -1757,7 +1610,6 @@ def generate_candidates_for_target(
                 left_column="name_fingerprint",
                 right_column="country_fingerprint",
                 blocker_name=BLOCKER_NAME_COUNTRY,
-                max_exact_key_frequency=config.max_exact_key_frequency,
             )
         )
 
@@ -1774,7 +1626,6 @@ def generate_candidates_for_target(
                 left_column="address_fingerprint",
                 right_column="country_fingerprint",
                 blocker_name=BLOCKER_ADDRESS_COUNTRY,
-                max_exact_key_frequency=config.max_exact_key_frequency,
             )
         )
 
@@ -1846,24 +1697,6 @@ def generate_candidates_for_target(
         )
 
     # ------------------------------------------------------------------
-    # name_soundex_country (phonetic blocker -- catches typo/OCR noise
-    # that no exact/token/prefix blocker can, e.g. "Seraices" vs
-    # "Services")
-    # ------------------------------------------------------------------
-
-    if config.enable_name_soundex_country:
-        blocker_frames.append(
-            _run_signature_block(
-                source1=source1,
-                target=target,
-                target_source=target_source,
-                value_column="business_name",
-                blocker_name=BLOCKER_NAME_SOUNDEX,
-                config=config,
-            )
-        )
-
-    # ------------------------------------------------------------------
     # name_token_pair_country / address_token_pair_country
     # ------------------------------------------------------------------
 
@@ -1890,30 +1723,6 @@ def generate_candidates_for_target(
                 config=config,
             )
         )
-
-    # ------------------------------------------------------------------
-    # DIAGNOSTIC: per-blocker candidate counts, before fusion.
-    #
-    # This exists so that if candidate volume ever explodes again, the
-    # actual offending blocker is visible directly rather than guessed
-    # at. Printed unconditionally (not gated behind a verbose flag) so
-    # it always shows up when running measure_blocking_recall.py or any
-    # other script that calls this function. Remove or gate this once
-    # you've diagnosed a specific run -- it's not meant to be permanent
-    # production logging.
-    # ------------------------------------------------------------------
-    print(f"\n{'=' * 70}\nBLOCKER COUNTS FOR {target_source}\n{'=' * 70}")
-
-    for frame in blocker_frames:
-        if frame is None or frame.empty:
-            print("  (empty blocker)")
-            continue
-
-        blocker_name = frame["blocker_sources"].iloc[0]
-
-        print(f"{blocker_name:<32} {len(frame):>12,} candidates")
-
-    print("=" * 70)
 
     return fuse_candidate_pairs(
         blocker_frames
